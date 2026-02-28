@@ -20,14 +20,9 @@ export interface Config {
   baseUrl: string
 
   /**
-   * 视为「不稳定」的 24 小时在线率阈值（百分比）
+   * 连续多少个 heartbeat 为掉线(0)时显示为「离线」
    */
-  unstableThreshold: number
-
-  /**
-   * 视为「严重不稳定 / 基本不可用」的 24 小时在线率阈值（百分比）
-   */
-  badThreshold: number
+  continuousDown: number
 
   /**
    * 近多少分钟内的心跳用来判断「近期状态」
@@ -44,12 +39,9 @@ export const Config: Schema<Config> = Schema.object({
   baseUrl: Schema.string()
     .default('https://miku.milkawa.xyz')
     .description('Status / Uptime Kuma 反代根地址（推荐使用全球加速节点 miku.milkawa.xyz，也可填写 https://status.awmc.cc 等）。'),
-  unstableThreshold: Schema.number()
-    .default(95)
-    .description('24 小时在线率低于该值时视为「不稳定」（单位：%）。'),
-  badThreshold: Schema.number()
-    .default(85)
-    .description('24 小时在线率低于该值时视为「严重不稳定 / 基本不可用」（单位：%）。'),
+  continuousDown: Schema.number()
+    .default(3)
+    .description('连续多少个 heartbeat 为掉线(0)时显示为「离线」。'),
   recentMinutes: Schema.number()
     .default(15)
     .description('用于统计「近多少分钟状态」的时间窗口。'),
@@ -178,10 +170,11 @@ function formatStatus(
     statusEmoji = '⬜'
     statusText = '未知'
   } else {
-    const last3 = list.slice(-3)
-    const continuousDown = last3.length >= 3 && last3.every((e) => e.status === 0)
+    const n = config.continuousDown
+    const lastN = list.slice(-n)
+    const isOffline = lastN.length >= n && lastN.every((e) => e.status === 0)
 
-    if (continuousDown) {
+    if (isOffline) {
       statusEmoji = '🟥'
       statusText = '离线'
     } else if (last.status === 0) {
