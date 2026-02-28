@@ -50,8 +50,28 @@ export const Config: Schema<Config> = Schema.object({
     .description('是否以合并转发形式发送状态（仅部分平台如 QQ 支持；不支持时会回退为普通消息）。')
 })
 
-interface StatusPagePreloadData {
-  publicGroupList: StatusGroup[]
+/** /api/status-page/maimai 返回的结构 */
+interface StatusPageApiResponse {
+  config?: { title?: string }
+  incidents?: StatusIncident[]
+  publicGroupList?: StatusGroup[]
+  maintenanceList?: StatusMaintenance[]
+}
+
+interface StatusIncident {
+  id: number
+  title: string
+  content?: string
+  active?: boolean
+}
+
+interface StatusMaintenance {
+  id: number
+  title: string
+  description?: string
+  status?: string
+  active?: boolean
+  dateRange?: [string, string]
 }
 
 interface StatusGroup {
@@ -71,7 +91,7 @@ interface StatusMonitor {
 
 /**
  * API 返回的单项：time 可能是时间戳(ms) 或 "YYYY-MM-DD HH:mm:ss.SSS" 字符串
- * status: 0 掉线 | 1 在线 | 2 不稳定
+ * status: 0 掉线 | 1 在线 | 2 不稳定 | 3 维护中
  */
 interface UptimeKumaHeartbeatEntryRaw {
   time: number | string
@@ -113,29 +133,17 @@ function normalizeHeartbeatList(
   }))
 }
 
-function parsePreloadData(html: string): StatusPagePreloadData {
-  const regex = /window\.preloadData\s*=\s*(\{[\s\S]*?});/
-  const match = regex.exec(html)
-
-  if (!match) {
-    throw new Error('未能在页面中找到 window.preloadData。')
-  }
-
-  const code = match[1]
-
-  try {
-    // 这里数据完全由受信任的 AWMC Status 页面提供
-    // 使用 Function 包裹为对象字面量进行安全求值
-    // eslint-disable-next-line no-new-func
-    const data = new Function(`"use strict"; return (${code});`)() as StatusPagePreloadData
-    if (!data || !Array.isArray(data.publicGroupList)) {
-      throw new Error('window.preloadData 结构异常。')
-    }
-    return data
-  } catch (error) {
-    logger.error(error)
-    throw new Error('解析 window.preloadData 失败。')
-  }
+function stripHtml(html: string): string {
+  return html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .trim()
 }
 
 /** 仅根据 heartbeat 的 time（已按 GMT 解析）筛选近期数据 */
@@ -183,6 +191,9 @@ function formatStatus(
     } else if (last.status === 2) {
       statusEmoji = '🟨'
       statusText = '不稳定'
+    } else if (last.status === 3) {
+      statusEmoji = '🟦'
+      statusText = '维护中'
     } else {
       statusEmoji = '🟩'
       statusText = '在线'
@@ -235,7 +246,7 @@ function formatStatus(
 
 export function apply(ctx: Context, config: Config) {
   const base = config.baseUrl.replace(/\/$/, '')
-  const statusUrl = `${base}/status/maimai`
+  const statusPageUrl = `${base}/api/status-page/maimai`
   const heartbeatUrl = `${base}/api/status-page/heartbeat/maimai`
 
   ctx.command('maidx.status', '查询舞萌DX服务器当前状态（AWMC / Uptime Kuma）')
@@ -243,17 +254,44 @@ export function apply(ctx: Context, config: Config) {
     .alias('舞萌状态')
     .action(async ({ session }) => {
       try {
-        const [html, heartbeatJson] = await Promise.all([
-          ctx.http.get<string>(statusUrl),
+        const [pageJson, heartbeatJson] = await Promise.all([
+          ctx.http.get<StatusPageApiResponse>(statusPageUrl),
           ctx.http.get<UptimeKumaHeartbeatResponse>(heartbeatUrl),
         ])
 
-        const preload = parsePreloadData(html)
-        const groups = preload.publicGroupList ?? []
+        const groups = pageJson?.publicGroupList ?? []
         const heartbeatMapRaw = heartbeatJson?.heartbeatList ?? {}
+        const title = pageJson?.config?.title ?? 'maimaiDX Server Status Regen'
 
         const groupBlocks: string[] = []
-        groupBlocks.push('maimaiDX Server Status Regen')
+        groupBlocks.push(title)
+
+        const incidents = pageJson?.incidents ?? []
+        const activeIncidents = incidents.filter((i) => i.active !== false)
+        if (activeIncidents.length > 0) {
+          const incidentLines: string[] = ['【公告】']
+          for (const inc of activeIncidents) {
+            incidentLines.push(`${inc.title}`)
+            if (inc.content) incidentLines.push(stripHtml(inc.content))
+          }
+          groupBlocks.push(incidentLines.join('\n'))
+        }
+
+        const maintenanceList = pageJson?.maintenanceList ?? []
+        const activeMaintenance = maintenanceList.filter(
+          (m) => m.status === 'under-maintenance' || m.active === true,
+        )
+        if (activeMaintenance.length > 0) {
+          const maintLines: string[] = ['【维护】']
+          for (const m of activeMaintenance) {
+            maintLines.push(`${m.title}`)
+            if (m.description) maintLines.push(stripHtml(m.description))
+            if (m.dateRange?.length === 2) {
+              maintLines.push(`时间：${m.dateRange[0]} ～ ${m.dateRange[1]}`)
+            }
+          }
+          groupBlocks.push(maintLines.join('\n'))
+        }
 
         const uptimeList = heartbeatJson?.uptimeList ?? {}
         for (const group of groups.sort((a, b) => a.weight - b.weight)) {
