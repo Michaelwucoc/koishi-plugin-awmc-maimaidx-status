@@ -1,4 +1,4 @@
-import { Context, Logger, Schema } from 'koishi'
+import { Context, h, Logger, Schema } from 'koishi'
 
 const logger = new Logger('awmc-maimaidx-status')
 
@@ -33,6 +33,11 @@ export interface Config {
    * 近多少分钟内的心跳用来判断「近期状态」
    */
   recentMinutes: number
+
+  /**
+   * 是否以合并转发形式发送状态（仅部分平台如 QQ 支持合并转发）
+   */
+  useForward: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -47,7 +52,10 @@ export const Config: Schema<Config> = Schema.object({
     .description('24 小时在线率低于该值时视为「严重不稳定 / 基本不可用」（单位：%）。'),
   recentMinutes: Schema.number()
     .default(15)
-    .description('用于统计「近多少分钟状态」的时间窗口。')
+    .description('用于统计「近多少分钟状态」的时间窗口。'),
+  useForward: Schema.boolean()
+    .default(false)
+    .description('是否以合并转发形式发送状态（仅部分平台如 QQ 支持；不支持时会回退为普通消息）。')
 })
 
 interface StatusPagePreloadData {
@@ -69,15 +77,41 @@ interface StatusMonitor {
   tags: string[]
 }
 
+/** API 返回的单项：time 可能是时间戳(ms) 或 "YYYY-MM-DD HH:mm:ss.SSS" 字符串 */
+interface UptimeKumaHeartbeatEntryRaw {
+  time: number | string
+  status: number
+  msg?: string
+  ping?: number | null
+}
+
+/** 标准化后的心跳项（time 统一为 ms 时间戳） */
 interface UptimeKumaHeartbeatEntry {
   time: number
   status: number
   msg?: string
-  ping?: number
+  ping?: number | null
 }
 
 interface UptimeKumaHeartbeatResponse {
-  heartbeatList: Record<string, UptimeKumaHeartbeatEntry[]>
+  heartbeatList: Record<string, UptimeKumaHeartbeatEntryRaw[]>
+}
+
+function parseHeartbeatTime(t: number | string): number {
+  if (typeof t === 'number') return t
+  const ms = Date.parse(t.replace(' ', 'T'))
+  return Number.isNaN(ms) ? 0 : ms
+}
+
+function normalizeHeartbeatList(
+  rawList: UptimeKumaHeartbeatEntryRaw[] | undefined,
+): UptimeKumaHeartbeatEntry[] {
+  if (!rawList || !Array.isArray(rawList)) return []
+  return rawList.map((e) => ({
+    ...e,
+    time: parseHeartbeatTime(e.time),
+    ping: e.ping ?? undefined,
+  }))
 }
 
 function parsePreloadData(html: string): StatusPagePreloadData {
@@ -188,6 +222,7 @@ function formatStatus(
     lines.push('    24小时在线率：暂无数据')
   }
 
+  const recentMins = config.recentMinutes
   if (recent.length) {
     const recentTotal = recent.length
     const recentDown = recent.filter((e) => e.status === 0).length
@@ -195,18 +230,27 @@ function formatStatus(
 
     let recentSummary: string
     if (recentDownRatio === 0) {
-      recentSummary = '近15分钟全部正常'
+      recentSummary = `近${recentMins}分钟全部正常`
     } else if (recentDownRatio < 0.3) {
-      recentSummary = '近15分钟偶发波动'
+      recentSummary = `近${recentMins}分钟偶发波动`
     } else if (recentDownRatio < 0.8) {
-      recentSummary = '近15分钟较多异常'
+      recentSummary = `近${recentMins}分钟较多异常`
     } else {
-      recentSummary = '近15分钟持续异常'
+      recentSummary = `近${recentMins}分钟持续异常`
     }
 
     lines.push(`    ${recentSummary}`)
+    const recentPings = recent.filter((e) => e.status !== 0 && e.ping != null && e.ping > 0).map((e) => e.ping!)
+    if (recentPings.length) {
+      const avgPing = Math.round(recentPings.reduce((a, b) => a + b, 0) / recentPings.length)
+      lines.push(`    近${recentMins}分钟平均 Ping：${avgPing} ms`)
+    }
   } else {
-    lines.push('    近15分钟：暂无心跳数据')
+    lines.push(`    近${recentMins}分钟：暂无心跳数据`)
+  }
+
+  if (last && last.status !== 0 && last.ping != null && last.ping > 0) {
+    lines.push(`    当前 Ping：${last.ping} ms`)
   }
 
   return lines
@@ -217,9 +261,7 @@ export function apply(ctx: Context, config: Config) {
   const statusUrl = `${base}/status/maimai`
   const heartbeatUrl = `${base}/api/status-page/heartbeat/maimai`
 
-  ctx.command('maidx.status', '查询舞萌DX服务器当前状态（AWMC / Uptime Kuma）', {
-    checkArgCount: true
-  })
+  ctx.command('maidx.status', '查询舞萌DX服务器当前状态（AWMC / Uptime Kuma）')
     .alias('maimai.status')
     .alias('舞萌状态')
     .action(async ({ session }) => {
@@ -231,26 +273,46 @@ export function apply(ctx: Context, config: Config) {
 
         const preload = parsePreloadData(html)
         const groups = preload.publicGroupList ?? []
-        const heartbeatMap = heartbeatJson?.heartbeatList ?? {}
+        const heartbeatMapRaw = heartbeatJson?.heartbeatList ?? {}
 
-        const lines: string[] = []
-        lines.push('maimaiDX Server Status Regen')
+        const groupBlocks: string[] = []
+        groupBlocks.push('maimaiDX Server Status Regen')
 
         for (const group of groups.sort((a, b) => a.weight - b.weight)) {
-          lines.push(`${group.name}`)
-
+          const blockLines: string[] = [group.name]
           for (const monitor of group.monitorList) {
             const key = String(monitor.id)
-            const list = heartbeatMap[key]
-            lines.push(...formatStatus(monitor, list, config))
+            const rawList = heartbeatMapRaw[key]
+            const list = normalizeHeartbeatList(rawList)
+            blockLines.push(...formatStatus(monitor, list, config))
           }
+          groupBlocks.push(blockLines.join('\n'))
         }
 
-        return lines.join('\n')
+        const fullText = groupBlocks.join('\n')
+        if (session) {
+          if (config.useForward && groupBlocks.length > 0) {
+            const selfId = session.bot?.selfId ?? ''
+            const forwardContent = h(
+              'message',
+              { forward: true },
+              ...groupBlocks.map((block) =>
+                h('message', h('author', { name: '舞萌DX状态', id: selfId }), block),
+              )
+            )
+            await session.send(forwardContent)
+          } else {
+            await session.send(fullText)
+          }
+          return
+        }
+        return fullText
       } catch (error) {
         logger.error(error)
         return '舞萌DX 状态查询失败，请稍后重试或联系管理员检查 Status 服务。'
       }
     })
 }
+
+export default { name, apply, Config }
 
