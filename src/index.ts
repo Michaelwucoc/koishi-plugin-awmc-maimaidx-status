@@ -1,0 +1,256 @@
+import { Context, Logger, Schema } from 'koishi'
+
+const logger = new Logger('awmc-maimaidx-status')
+
+declare module 'koishi' {
+  interface Tables {
+    // 目前不需要持久化存储，预留扩展点
+  }
+}
+
+export const name = 'awmc-maimaidx-status'
+
+export interface Config {
+  /**
+   * Status / Uptime Kuma 反代根地址
+   * 例如：
+   * - https://status.awmc.cc
+   * - https://miku.milkawa.xyz
+   */
+  baseUrl: string
+
+  /**
+   * 视为「不稳定」的 24 小时在线率阈值（百分比）
+   */
+  unstableThreshold: number
+
+  /**
+   * 视为「严重不稳定 / 基本不可用」的 24 小时在线率阈值（百分比）
+   */
+  badThreshold: number
+
+  /**
+   * 近多少分钟内的心跳用来判断「近期状态」
+   */
+  recentMinutes: number
+}
+
+export const Config: Schema<Config> = Schema.object({
+  baseUrl: Schema.string()
+    .default('https://miku.milkawa.xyz')
+    .description('Status / Uptime Kuma 反代根地址（推荐使用全球加速节点 miku.milkawa.xyz，也可填写 https://status.awmc.cc 等）。'),
+  unstableThreshold: Schema.number()
+    .default(95)
+    .description('24 小时在线率低于该值时视为「不稳定」（单位：%）。'),
+  badThreshold: Schema.number()
+    .default(85)
+    .description('24 小时在线率低于该值时视为「严重不稳定 / 基本不可用」（单位：%）。'),
+  recentMinutes: Schema.number()
+    .default(15)
+    .description('用于统计「近多少分钟状态」的时间窗口。')
+})
+
+interface StatusPagePreloadData {
+  publicGroupList: StatusGroup[]
+}
+
+interface StatusGroup {
+  id: number
+  name: string
+  weight: number
+  monitorList: StatusMonitor[]
+}
+
+interface StatusMonitor {
+  id: number
+  name: string
+  sendUrl: number
+  type: string
+  tags: string[]
+}
+
+interface UptimeKumaHeartbeatEntry {
+  time: number
+  status: number
+  msg?: string
+  ping?: number
+}
+
+interface UptimeKumaHeartbeatResponse {
+  heartbeatList: Record<string, UptimeKumaHeartbeatEntry[]>
+}
+
+function parsePreloadData(html: string): StatusPagePreloadData {
+  const regex = /window\.preloadData\s*=\s*(\{[\s\S]*?});/
+  const match = regex.exec(html)
+
+  if (!match) {
+    throw new Error('未能在页面中找到 window.preloadData。')
+  }
+
+  const code = match[1]
+
+  try {
+    // 这里数据完全由受信任的 AWMC Status 页面提供
+    // 使用 Function 包裹为对象字面量进行安全求值
+    // eslint-disable-next-line no-new-func
+    const data = new Function(`"use strict"; return (${code});`)() as StatusPagePreloadData
+    if (!data || !Array.isArray(data.publicGroupList)) {
+      throw new Error('window.preloadData 结构异常。')
+    }
+    return data
+  } catch (error) {
+    logger.error(error)
+    throw new Error('解析 window.preloadData 失败。')
+  }
+}
+
+function computeUptime(entries: UptimeKumaHeartbeatEntry[], thresholdMs: number): { uptime24h: number | null; recent: UptimeKumaHeartbeatEntry[] } {
+  const now = Date.now()
+  const cutoff24h = now - 24 * 60 * 60 * 1000
+  const cutoffRecent = now - thresholdMs
+
+  const in24h = entries.filter((e) => e.time >= cutoff24h)
+  const inRecent = entries.filter((e) => e.time >= cutoffRecent)
+
+  if (!in24h.length) {
+    return { uptime24h: null, recent: inRecent }
+  }
+
+  const upCount = in24h.filter((e) => e.status !== 0).length
+  const uptime24h = (upCount / in24h.length) * 100
+
+  return { uptime24h, recent: inRecent }
+}
+
+function formatStatus(
+  monitor: StatusMonitor,
+  entries: UptimeKumaHeartbeatEntry[] | undefined,
+  config: Config,
+): string[] {
+  const lines: string[] = []
+
+  const list = entries ?? []
+  const last = list[list.length - 1]
+  const { uptime24h, recent } = computeUptime(list, config.recentMinutes * 60 * 1000)
+
+  let statusEmoji = '⬜'
+  let statusText = '未知'
+
+  if (!list.length || !last) {
+    statusEmoji = '⬜'
+    statusText = '未知'
+  } else {
+    const recentTotal = recent.length
+    const recentDown = recent.filter((e) => e.status === 0).length
+    const recentDownRatio = recentTotal ? recentDown / recentTotal : 0
+
+    const isDownNow = last.status === 0
+
+    if (isDownNow) {
+      if (recentDownRatio > 0.8) {
+        statusEmoji = '🟥'
+        statusText = '离线'
+      } else {
+        statusEmoji = '🟥'
+        statusText = '不稳定'
+      }
+    } else {
+      if (uptime24h != null) {
+        if (uptime24h < config.badThreshold) {
+          statusEmoji = '🟥'
+          statusText = '不稳定'
+        } else if (uptime24h < config.unstableThreshold || recentDownRatio > 0) {
+          statusEmoji = '🟨'
+          statusText = '不稳定'
+        } else {
+          statusEmoji = '🟩'
+          statusText = '在线'
+        }
+      } else {
+        if (recentDownRatio > 0) {
+          statusEmoji = '🟨'
+          statusText = '不稳定'
+        } else {
+          statusEmoji = '🟩'
+          statusText = '在线'
+        }
+      }
+    }
+  }
+
+  lines.push(`  ${monitor.name}`)
+  lines.push(`    状态：${statusEmoji}${statusText}`)
+
+  if (uptime24h != null) {
+    lines.push(`    24小时在线率：${uptime24h.toFixed(4)}%`)
+  } else {
+    lines.push('    24小时在线率：暂无数据')
+  }
+
+  if (recent.length) {
+    const recentTotal = recent.length
+    const recentDown = recent.filter((e) => e.status === 0).length
+    const recentDownRatio = recentDown / recentTotal
+
+    let recentSummary: string
+    if (recentDownRatio === 0) {
+      recentSummary = '近15分钟全部正常'
+    } else if (recentDownRatio < 0.3) {
+      recentSummary = '近15分钟偶发波动'
+    } else if (recentDownRatio < 0.8) {
+      recentSummary = '近15分钟较多异常'
+    } else {
+      recentSummary = '近15分钟持续异常'
+    }
+
+    lines.push(`    ${recentSummary}`)
+  } else {
+    lines.push('    近15分钟：暂无心跳数据')
+  }
+
+  return lines
+}
+
+export function apply(ctx: Context, config: Config) {
+  const base = config.baseUrl.replace(/\/$/, '')
+  const statusUrl = `${base}/status/maimai`
+  const heartbeatUrl = `${base}/api/status-page/heartbeat/maimai`
+
+  ctx.command('maidx.status', '查询舞萌DX服务器当前状态（AWMC / Uptime Kuma）', {
+    checkArgCount: true
+  })
+    .alias('maimai.status')
+    .alias('舞萌状态')
+    .action(async ({ session }) => {
+      try {
+        const [html, heartbeatJson] = await Promise.all([
+          ctx.http.get<string>(statusUrl),
+          ctx.http.get<UptimeKumaHeartbeatResponse>(heartbeatUrl),
+        ])
+
+        const preload = parsePreloadData(html)
+        const groups = preload.publicGroupList ?? []
+        const heartbeatMap = heartbeatJson?.heartbeatList ?? {}
+
+        const lines: string[] = []
+        lines.push('maimaiDX Server Status Regen')
+
+        for (const group of groups.sort((a, b) => a.weight - b.weight)) {
+          lines.push(`${group.name}`)
+
+          for (const monitor of group.monitorList) {
+            const key = String(monitor.id)
+            const list = heartbeatMap[key]
+            lines.push(...formatStatus(monitor, list, config))
+          }
+        }
+
+        return lines.join('\n')
+      } catch (error) {
+        logger.error(error)
+        return '舞萌DX 状态查询失败，请稍后重试或联系管理员检查 Status 服务。'
+      }
+    })
+}
+
