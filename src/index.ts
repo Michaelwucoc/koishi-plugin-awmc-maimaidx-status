@@ -96,7 +96,7 @@ interface UptimeKumaHeartbeatEntry {
 interface UptimeKumaHeartbeatResponse {
   heartbeatList: Record<string, UptimeKumaHeartbeatEntryRaw[]>
   /** 24 小时可用率，键为 "1_24"、"4_24" 等，值为 0～1 的小数（如 0.256 表示 25.6%） */
-  [key: string]: unknown
+  uptimeList?: Record<string, number>
 }
 
 /** 解析 heartbeat 的 time：API 返回为 GMT，按 UTC 解析得到正确时间戳 */
@@ -277,14 +277,14 @@ export function apply(ctx: Context, config: Config) {
         const groupBlocks: string[] = []
         groupBlocks.push('maimaiDX Server Status Regen')
 
-        const ratio24Map = heartbeatJson as UptimeKumaHeartbeatResponse
+        const uptimeList = heartbeatJson?.uptimeList ?? {}
         for (const group of groups.sort((a, b) => a.weight - b.weight)) {
           const blockLines: string[] = [group.name]
           for (const monitor of group.monitorList) {
             const key = String(monitor.id)
             const rawList = heartbeatMapRaw[key]
             const list = normalizeHeartbeatList(rawList)
-            const ratio24 = ratio24Map[`${monitor.id}_24`]
+            const ratio24 = uptimeList[`${monitor.id}_24`]
             const ratio =
               typeof ratio24 === 'number' && Number.isFinite(ratio24) ? ratio24 : undefined
             blockLines.push(...formatStatus(monitor, list, config, ratio))
