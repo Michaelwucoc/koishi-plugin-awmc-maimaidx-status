@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-awmc-maimaidx-status",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "舞萌DX 服务器状态查询（集成 AWMC Status / Uptime Kuma 数据）的 Koishi 插件。",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",

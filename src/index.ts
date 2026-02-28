@@ -95,11 +95,15 @@ interface UptimeKumaHeartbeatEntry {
 
 interface UptimeKumaHeartbeatResponse {
   heartbeatList: Record<string, UptimeKumaHeartbeatEntryRaw[]>
+  /** 24 小时可用率，键为 "1_24"、"4_24" 等，值为 0～1 的小数（如 0.256 表示 25.6%） */
+  [key: string]: unknown
 }
 
+/** 解析 heartbeat 的 time：API 返回为 GMT，按 UTC 解析得到正确时间戳 */
 function parseHeartbeatTime(t: number | string): number {
   if (typeof t === 'number') return t
-  const ms = Date.parse(t.replace(' ', 'T'))
+  const s = String(t).trim().replace(' ', 'T')
+  const ms = Date.parse(s.endsWith('Z') ? s : s + 'Z')
   return Number.isNaN(ms) ? 0 : ms
 }
 
@@ -139,34 +143,29 @@ function parsePreloadData(html: string): StatusPagePreloadData {
   }
 }
 
-function computeUptime(entries: UptimeKumaHeartbeatEntry[], thresholdMs: number): { uptime24h: number | null; recent: UptimeKumaHeartbeatEntry[] } {
-  const now = Date.now()
-  const cutoff24h = now - 24 * 60 * 60 * 1000
-  const cutoffRecent = now - thresholdMs
-
-  const in24h = entries.filter((e) => e.time >= cutoff24h)
-  const inRecent = entries.filter((e) => e.time >= cutoffRecent)
-
-  if (!in24h.length) {
-    return { uptime24h: null, recent: inRecent }
-  }
-
-  const upCount = in24h.filter((e) => e.status !== 0).length
-  const uptime24h = (upCount / in24h.length) * 100
-
-  return { uptime24h, recent: inRecent }
+/** 仅根据 heartbeat 的 time（已按 GMT 解析）筛选近期数据 */
+function getRecentHeartbeats(
+  entries: UptimeKumaHeartbeatEntry[],
+  recentMs: number,
+): UptimeKumaHeartbeatEntry[] {
+  const cutoff = Date.now() - recentMs
+  return entries.filter((e) => e.time >= cutoff)
 }
 
 function formatStatus(
   monitor: StatusMonitor,
   entries: UptimeKumaHeartbeatEntry[] | undefined,
   config: Config,
+  /** API 返回的 24 小时可用率，0～1（如 0.256 表示 25.6%） */
+  uptime24Ratio?: number,
 ): string[] {
   const lines: string[] = []
 
   const list = entries ?? []
   const last = list[list.length - 1]
-  const { uptime24h, recent } = computeUptime(list, config.recentMinutes * 60 * 1000)
+  const recentMs = config.recentMinutes * 60 * 1000
+  const recent = getRecentHeartbeats(list, recentMs)
+  const uptime24h = uptime24Ratio != null ? uptime24Ratio * 100 : null
 
   let statusEmoji = '⬜'
   let statusText = '未知'
@@ -217,9 +216,9 @@ function formatStatus(
   lines.push(`    状态：${statusEmoji}${statusText}`)
 
   if (uptime24h != null) {
-    lines.push(`    24小时在线率：${uptime24h.toFixed(4)}%`)
+    lines.push(`    24小时可用率：${Math.round(uptime24h)}%`)
   } else {
-    lines.push('    24小时在线率：暂无数据')
+    lines.push('    24小时可用率：暂无数据')
   }
 
   const recentMins = config.recentMinutes
@@ -278,13 +277,17 @@ export function apply(ctx: Context, config: Config) {
         const groupBlocks: string[] = []
         groupBlocks.push('maimaiDX Server Status Regen')
 
+        const ratio24Map = heartbeatJson as UptimeKumaHeartbeatResponse
         for (const group of groups.sort((a, b) => a.weight - b.weight)) {
           const blockLines: string[] = [group.name]
           for (const monitor of group.monitorList) {
             const key = String(monitor.id)
             const rawList = heartbeatMapRaw[key]
             const list = normalizeHeartbeatList(rawList)
-            blockLines.push(...formatStatus(monitor, list, config))
+            const ratio24 = ratio24Map[`${monitor.id}_24`]
+            const ratio =
+              typeof ratio24 === 'number' && Number.isFinite(ratio24) ? ratio24 : undefined
+            blockLines.push(...formatStatus(monitor, list, config, ratio))
           }
           groupBlocks.push(blockLines.join('\n'))
         }
