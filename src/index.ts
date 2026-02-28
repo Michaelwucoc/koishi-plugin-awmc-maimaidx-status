@@ -77,7 +77,10 @@ interface StatusMonitor {
   tags: string[]
 }
 
-/** API 返回的单项：time 可能是时间戳(ms) 或 "YYYY-MM-DD HH:mm:ss.SSS" 字符串 */
+/**
+ * API 返回的单项：time 可能是时间戳(ms) 或 "YYYY-MM-DD HH:mm:ss.SSS" 字符串
+ * status: 0 掉线 | 1 在线 | 2 不稳定
+ */
 interface UptimeKumaHeartbeatEntryRaw {
   time: number | string
   status: number
@@ -167,6 +170,7 @@ function formatStatus(
   const recent = getRecentHeartbeats(list, recentMs)
   const uptime24h = uptime24Ratio != null ? uptime24Ratio * 100 : null
 
+  // 0 掉线 1 在线 2 不稳定。单次查询中用 🟨 表示不稳定；总结中只把 0 当作异常，忽略 2
   let statusEmoji = '⬜'
   let statusText = '未知'
 
@@ -174,41 +178,21 @@ function formatStatus(
     statusEmoji = '⬜'
     statusText = '未知'
   } else {
-    const recentTotal = recent.length
-    const recentDown = recent.filter((e) => e.status === 0).length
-    const recentDownRatio = recentTotal ? recentDown / recentTotal : 0
+    const last3 = list.slice(-3)
+    const continuousDown = last3.length >= 3 && last3.every((e) => e.status === 0)
 
-    const isDownNow = last.status === 0
-
-    if (isDownNow) {
-      if (recentDownRatio > 0.8) {
-        statusEmoji = '🟥'
-        statusText = '离线'
-      } else {
-        statusEmoji = '🟥'
-        statusText = '不稳定'
-      }
+    if (continuousDown) {
+      statusEmoji = '🟥'
+      statusText = '离线'
+    } else if (last.status === 0) {
+      statusEmoji = '🟨'
+      statusText = '不稳定'
+    } else if (last.status === 2) {
+      statusEmoji = '🟨'
+      statusText = '不稳定'
     } else {
-      if (uptime24h != null) {
-        if (uptime24h < config.badThreshold) {
-          statusEmoji = '🟥'
-          statusText = '不稳定'
-        } else if (uptime24h < config.unstableThreshold || recentDownRatio > 0) {
-          statusEmoji = '🟨'
-          statusText = '不稳定'
-        } else {
-          statusEmoji = '🟩'
-          statusText = '在线'
-        }
-      } else {
-        if (recentDownRatio > 0) {
-          statusEmoji = '🟨'
-          statusText = '不稳定'
-        } else {
-          statusEmoji = '🟩'
-          statusText = '在线'
-        }
-      }
+      statusEmoji = '🟩'
+      statusText = '在线'
     }
   }
 
@@ -228,6 +212,7 @@ function formatStatus(
     const recentDownRatio = recentDown / recentTotal
 
     let recentSummary: string
+    // 总结中仅把 0（掉线）计为异常，忽略 2（不稳定）
     if (recentDownRatio === 0) {
       recentSummary = `近${recentMins}分钟全部正常`
     } else if (recentDownRatio < 0.3) {
