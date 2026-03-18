@@ -430,5 +430,5 @@ export function apply(ctx: Context, config: Config) {
     })
 }
 
-export default { name, apply, Config }
+export default { name, apply, Config, inject }
 
