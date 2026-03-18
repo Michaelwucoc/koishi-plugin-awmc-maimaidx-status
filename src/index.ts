@@ -1,14 +1,13 @@
 import { Context, h, Logger, Schema } from 'koishi'
+import {} from 'koishi-plugin-puppeteer'
+import * as path from 'path'
+import * as fs from 'fs'
 
 const logger = new Logger('awmc-maimaidx-status')
 
-declare module 'koishi' {
-  interface Tables {
-    // 目前不需要持久化存储，预留扩展点
-  }
-}
-
 export const name = 'awmc-maimaidx-status'
+
+export const inject = ['puppeteer']
 
 export interface Config {
   /**
@@ -30,9 +29,17 @@ export interface Config {
   recentMinutes: number
 
   /**
-   * 是否以合并转发形式发送状态（仅部分平台如 QQ 支持合并转发）
+   * 发送消息模式
+   * - text: 消息（纯文本）
+   * - forward: 消息（聊天记录）
+   * - image: 图片
    */
-  useForward: boolean
+  outputMode: 'text' | 'forward' | 'image'
+
+  /**
+   * 图片缓存时间 (分钟)
+   */
+  cacheTime: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -45,9 +52,14 @@ export const Config: Schema<Config> = Schema.object({
   recentMinutes: Schema.number()
     .default(15)
     .description('用于统计「近多少分钟状态」的时间窗口。'),
-  useForward: Schema.boolean()
-    .default(false)
-    .description('是否以合并转发形式发送状态（仅部分平台如 QQ 支持；不支持时会回退为普通消息）。')
+  outputMode: Schema.union([
+    Schema.const('text').description('消息（纯文本）'),
+    Schema.const('forward').description('消息（聊天记录/合并转发）'),
+    Schema.const('image').description('图片'),
+  ]).default('text').description('发送状态消息的模式。'),
+  cacheTime: Schema.number()
+    .default(5)
+    .description('图片缓存时间 (分钟)')
 })
 
 /** /api/status-page/maimai 返回的结构 */
@@ -244,15 +256,97 @@ function formatStatus(
   return lines
 }
 
+// 进程内缓存，设置分钟内复用截图
+let lastScreenshot: Buffer | null = null
+let lastFetchedAt: number | null = null
+
 export function apply(ctx: Context, config: Config) {
+  // 插件启动时初始化缓存目录
+  const cacheDir = path.resolve(ctx.baseDir, 'cache/maimai-status')
+  if (!fs.existsSync(cacheDir)) {
+    fs.mkdirSync(cacheDir, { recursive: true })
+    ctx.logger.info(`Created cache directory: ${cacheDir}`)
+  }
   const base = config.baseUrl.replace(/\/$/, '')
   const statusPageUrl = `${base}/api/status-page/maimai`
   const heartbeatUrl = `${base}/api/status-page/heartbeat/maimai`
+
+  async function getScreenshot(session: any) {
+    if (!session) return
+    // 使用缓存
+    const cacheFile = path.resolve(ctx.baseDir, 'cache/maimai-status/maimai-status.png')
+    if (lastScreenshot && lastFetchedAt && Date.now() - lastFetchedAt < config.cacheTime * 60 * 1000) {
+      ctx.logger.info(`在缓存时间内，发送缓存图片`)
+      return h.image(lastScreenshot, 'image/png')
+    }
+    const url = "https://status.awmc.cc/status/maimai"
+
+    let page
+    try {
+      await session.send('获取数据中，请稍后喵~')
+      page = await ctx.puppeteer.page();
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        Object.defineProperty(navigator, 'language', { get: () => 'zh-CN' });
+        Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh'] });
+        (window as any).chrome = { runtime: {} };
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters: any) => (
+          parameters.name === 'notifications'
+            ? Promise.resolve({ state: 'denied' } as PermissionStatus)
+            : originalQuery(parameters)
+        );
+        Object.defineProperty(navigator, 'plugins', {
+          get: () => [1, 2, 3, 4, 5]
+        });
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['zh-CN', 'zh', 'en']
+        });
+      })
+
+      await page.setViewport({ width: 1280, height: 720, deviceScaleFactor: 2 })
+
+      const PAGE_LOAD_TIMEOUT_MS = 30000
+
+      await page.setDefaultNavigationTimeout(PAGE_LOAD_TIMEOUT_MS)
+      await page.goto(url, {
+        waitUntil: 'networkidle2',
+        timeout: PAGE_LOAD_TIMEOUT_MS,
+      })
+
+      await new Promise(resolve => setTimeout(resolve, 500))
+
+      const buffer = await page.screenshot({
+        fullPage: true,
+      })
+
+      // 更新缓存
+      lastScreenshot = buffer as Buffer
+      lastFetchedAt = Date.now()
+      try {
+        fs.writeFileSync(cacheFile, buffer)
+      } catch (writeErr) {
+        ctx.logger.warn(`Failed to write cache file: ${writeErr}`)
+      }
+
+      // 返回图片
+      return h.image(buffer, 'image/png')
+    } catch (err) {
+      ctx.logger.error(err)
+      return '截图失败，详见后台日志'
+    } finally {
+      if (page) await page.close()
+    }
+  }
 
   ctx.command('maidx.status', '查询舞萌DX服务器当前状态（AWMC / Uptime Kuma）')
     .alias('maimai.status')
     .alias('舞萌状态')
     .action(async ({ session }) => {
+      if (!session) return
+      if (config.outputMode === 'image') {
+        return getScreenshot(session)
+      }
       try {
         const [pageJson, heartbeatJson] = await Promise.all([
           ctx.http.get<StatusPageApiResponse>(statusPageUrl),
@@ -309,27 +403,30 @@ export function apply(ctx: Context, config: Config) {
         }
 
         const fullText = groupBlocks.join('\n')
-        if (session) {
-          if (config.useForward && groupBlocks.length > 0) {
-            const selfId = session.bot?.selfId ?? ''
-            const forwardContent = h(
-              'message',
-              { forward: true },
-              ...groupBlocks.map((block) =>
-                h('message', h('author', { name: '舞萌DX状态', id: selfId }), block),
-              )
+        if (config.outputMode === 'forward' && groupBlocks.length > 0) {
+          const selfId = session.bot?.selfId ?? ''
+          const forwardContent = h(
+            'message',
+            { forward: true },
+            ...groupBlocks.map((block) =>
+              h('message', h('author', { name: '舞萌DX状态', id: selfId }), block),
             )
-            await session.send(forwardContent)
-          } else {
-            await session.send(fullText)
-          }
-          return
+          )
+          await session.send(forwardContent)
+        } else {
+          await session.send(fullText)
         }
-        return fullText
+        return
       } catch (error) {
         logger.error(error)
         return '舞萌DX 状态查询失败，请稍后重试或联系管理员检查 Status 服务。'
       }
+    })
+
+  ctx.command('maidx.screenshot', '获取舞萌DX服务器状态截图')
+    .alias('有网吗')
+    .action(async ({ session }) => {
+      return getScreenshot(session)
     })
 }
 
