@@ -40,6 +40,11 @@ export interface Config {
    * 图片缓存时间 (分钟)
    */
   cacheTime: number
+
+  /**
+   * 截图页面的 URL
+   */
+  screenshotUrl: string
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -59,7 +64,10 @@ export const Config: Schema<Config> = Schema.object({
   ]).default('text').description('发送状态消息的模式。'),
   cacheTime: Schema.number()
     .default(5)
-    .description('图片缓存时间 (分钟)')
+    .description('图片缓存时间 (分钟)'),
+  screenshotUrl: Schema.string()
+    .default('https://status.awmc.cc/status/maimai-lite')
+    .description('截图页面的 URL 地址。')
 })
 
 /** /api/status-page/maimai 返回的结构 */
@@ -279,7 +287,7 @@ export function apply(ctx: Context, config: Config) {
       ctx.logger.info(`在缓存时间内，发送缓存图片`)
       return h.image(lastScreenshot, 'image/png')
     }
-    const url = "https://status.awmc.cc/status/maimai"
+    const url = config.screenshotUrl
 
     let page
     try {
