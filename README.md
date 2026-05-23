@@ -14,7 +14,7 @@
   - 🟩 在线
   - 🟨 不稳定
   - 🟥 不稳定 / 离线
-- **输出示例（格式接近 @迪拉熊 的 maiup）**：
+- **输出示例（格式接近 @迪拉熊 的 [maiup](https://codeberg.org/Derakkuma/dxkuma-bot/src/branch/platform/qq/plugins/uptime)）**：
 
 ```text
 maimaiDX Server Status Regen
